@@ -1,19 +1,3 @@
-# Fetch the latest Amazon Linux 2023 AMI
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-*-x86_64"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
 # IAM Role for backend EC2 — allows SSM access and CloudWatch logging
 resource "aws_iam_role" "backend" {
   name = "${var.project_name}-backend-role"
@@ -49,6 +33,29 @@ resource "aws_iam_role_policy_attachment" "backend_cloudwatch" {
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
+# S3 access for pulling deployment artifacts
+resource "aws_iam_role_policy" "backend_s3" {
+  name = "${var.project_name}-backend-s3-policy"
+  role = aws_iam_role.backend.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::${var.project_name}-frontend-${var.environment}",
+          "arn:aws:s3:::${var.project_name}-frontend-${var.environment}/*"
+        ]
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "backend" {
   name = "${var.project_name}-backend-profile"
   role = aws_iam_role.backend.name
@@ -70,7 +77,7 @@ resource "aws_lb" "main" {
   }
 }
 
-# Target Group — the ALB uses this to know which EC2s to send traffic to
+# Target Group
 resource "aws_lb_target_group" "backend" {
   name     = "${var.project_name}-tg"
   port     = 8080
@@ -95,7 +102,7 @@ resource "aws_lb_target_group" "backend" {
   }
 }
 
-# ALB Listener — listens on port 80 and forwards to target group
+# ALB Listener
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80
@@ -107,10 +114,10 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# Backend EC2 Instances — two across different AZs
+# Backend EC2 Instances
 resource "aws_instance" "backend" {
   count                  = 2
-  ami                    = data.aws_ami.amazon_linux.id
+  ami                    = "ami-0102a36b3e9d5e4df"
   instance_type          = var.instance_type
   subnet_id              = var.private_subnet_ids[count.index]
   vpc_security_group_ids = [var.backend_sg_id]
@@ -123,107 +130,16 @@ resource "aws_instance" "backend" {
     encrypted   = true
   }
 
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    set -e
-
-    # Install dependencies
-    dnf install -y golang git amazon-cloudwatch-agent
-
-    # Create app directory and user
-    useradd -r -s /bin/false appuser
-    mkdir -p /opt/much-to-do
-    chown appuser:appuser /opt/much-to-do
-
-    # Write environment file
-    cat > /opt/much-to-do/.env << 'ENVFILE'
-    PORT=8080
-    MONGO_URI=mongodb://${var.mongo_username}:${var.mongo_password}@${var.mongo_host}:27017/${var.mongo_db_name}?authSource=admin
-    DB_NAME=${var.mongo_db_name}
-    JWT_SECRET_KEY=${var.jwt_secret_key}
-    JWT_EXPIRATION_HOURS=72
-    ENABLE_CACHE=true
-    REDIS_ADDR=${var.redis_host}:6379
-    REDIS_PASSWORD=
-    LOG_LEVEL=INFO
-    LOG_FORMAT=json
-    ALLOWED_ORIGINS=https://${var.cloudfront_domain}
-    COOKIE_DOMAINS=${var.cloudfront_domain}
-    SECURE_COOKIE=true
-    ENVFILE
-
-    chown appuser:appuser /opt/much-to-do/.env
-    chmod 600 /opt/much-to-do/.env
-
-    # Clone the application
-    git clone -b feature/full-stack https://github.com/${var.github_repo}.git /tmp/much-to-do
-    cp -r /tmp/much-to-do/Server/MuchToDo/* /opt/much-to-do/
-    chown -R appuser:appuser /opt/much-to-do
-
-    # Build the Go binary
-    cd /opt/much-to-do
-    go build -o much-to-do-server ./cmd/api/
-
-    # Create systemd service
-    cat > /etc/systemd/system/much-to-do.service << 'SERVICE'
-    [Unit]
-    Description=MuchToDo API Server
-    After=network.target
-
-    [Service]
-    Type=simple
-    User=appuser
-    WorkingDirectory=/opt/much-to-do
-    ExecStart=/opt/much-to-do/much-to-do-server
-    Restart=always
-    RestartSec=5
-    StandardOutput=journal
-    StandardError=journal
-    SyslogIdentifier=much-to-do
-
-    [Install]
-    WantedBy=multi-user.target
-    SERVICE
-
-    systemctl daemon-reload
-    systemctl enable much-to-do
-    systemctl start much-to-do
-
-    # Configure CloudWatch agent
-    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CW'
-    {
-      "logs": {
-        "logs_collected": {
-          "files": {
-            "collect_list": [
-              {
-                "file_path": "/var/log/much-to-do.log",
-                "log_group_name": "/much-to-do/production/backend",
-                "log_stream_name": "{instance_id}",
-                "timezone": "UTC"
-              }
-            ]
-          }
-        }
-      }
-    }
-    CW
-
-    # Also capture journald logs for the app
-    cat > /etc/systemd/journald.conf.d/much-to-do.conf << 'JOURNAL'
-    [Journal]
-    ForwardToSyslog=yes
-    JOURNAL
-
-    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-      -a fetch-config \
-      -m ec2 \
-      -s \
-      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-
-    echo "Backend setup complete"
-  EOF
-  )
+  user_data = base64encode(templatefile("${path.module}/userdata-backend.sh", {
+    mongo_username    = var.mongo_username
+    mongo_password    = var.mongo_password
+    mongo_host        = var.mongo_host
+    mongo_db_name     = var.mongo_db_name
+    redis_host        = var.redis_host
+    jwt_secret_key    = var.jwt_secret_key
+    cloudfront_domain = var.cloudfront_domain
+    github_repo       = var.github_repo
+  }))
 
   tags = {
     Name        = "${var.project_name}-backend-${count.index + 1}"

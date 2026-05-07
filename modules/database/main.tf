@@ -1,24 +1,6 @@
-
-# Fetch the latest Amazon Linux 2023 AMI
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-*-x86_64"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
 # IAM Role for MongoDB EC2 — allows SSM access so you can connect without SSH
 resource "aws_iam_role" "mongodb" {
   name = "${var.project_name}-mongodb-role"
-
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -31,7 +13,6 @@ resource "aws_iam_role" "mongodb" {
       }
     ]
   })
-
   tags = {
     Name        = "${var.project_name}-mongodb-role"
     Environment = var.environment
@@ -51,7 +32,7 @@ resource "aws_iam_instance_profile" "mongodb" {
 
 # MongoDB EC2 Instance
 resource "aws_instance" "mongodb" {
-  ami                    = data.aws_ami.amazon_linux.id
+  ami                    = "ami-0102a36b3e9d5e4df"
   instance_type          = var.instance_type
   subnet_id              = var.private_subnet_ids[0]
   vpc_security_group_ids = [var.mongodb_sg_id]
@@ -64,55 +45,11 @@ resource "aws_instance" "mongodb" {
     encrypted   = true
   }
 
-  # Startup script — installs and configures MongoDB with auth
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    set -e
-
-    # Install MongoDB 7
-    cat > /etc/yum.repos.d/mongodb-org-7.0.repo << 'REPO'
-    [mongodb-org-7.0]
-    name=MongoDB Repository
-    baseurl=https://repo.mongodb.org/yum/amazon/2023/mongodb-org/7.0/x86_64/
-    gpgcheck=1
-    enabled=1
-    gpgkey=https://pgp.mongodb.com/server-7.0.asc
-    REPO
-
-    dnf install -y mongodb-org
-
-    # Start and enable MongoDB
-    systemctl start mongod
-    systemctl enable mongod
-
-    # Wait for MongoDB to be ready
-    sleep 10
-
-    # Create admin user with authentication
-    mongosh --eval "
-      use admin
-      db.createUser({
-        user: '${var.mongo_username}',
-        pwd: '${var.mongo_password}',
-        roles: [
-          { role: 'userAdminAnyDatabase', db: 'admin' },
-          { role: 'readWriteAnyDatabase', db: 'admin' }
-        ]
-      })
-    "
-
-    # Enable MongoDB authentication
-    sed -i 's/#security:/security:\n  authorization: enabled/' /etc/mongod.conf
-
-    # Allow connections from within the VPC (not just localhost)
-    sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
-
-    # Restart MongoDB to apply changes
-    systemctl restart mongod
-
-    echo "MongoDB setup complete"
-  EOF
-  )
+  user_data = base64encode(templatefile("${path.module}/userdata-mongodb.sh", {
+    mongo_username = var.mongo_username
+    mongo_password = var.mongo_password
+    mongo_db_name  = var.mongo_db_name
+  }))
 
   tags = {
     Name        = "${var.project_name}-mongodb"
@@ -148,4 +85,3 @@ resource "aws_elasticache_cluster" "redis" {
     Environment = var.environment
   }
 }
-

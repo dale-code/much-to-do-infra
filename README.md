@@ -79,7 +79,7 @@ Terraform state is stored remotely in S3 with DynamoDB locking:
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/much-to-do-infra.git
+git clone https://github.com/dale-code/much-to-do-infra.git
 cd much-to-do-infra
 ```
 
